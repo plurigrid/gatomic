@@ -28,4 +28,9 @@
              :extra-paths ["src"]
              :jvm-opts ["-Xmx4g"]}
 
+  :vcvrack {:extra-deps {com.rpl/specter {:mvn/version "1.1.4"}
+                          overtone/overtone {:mvn/version "0.14.3199"}}
+             :extra-paths ["src"]
+             :jvm-opts ["-Xmx4g"]}
+
   :nrepl {:main-opts ["-m" "nrepl.cmdline" "--port" "1670"]}}}

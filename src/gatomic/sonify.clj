@@ -10,6 +10,7 @@
      :tick/tau    → note duration (WLC residence time)
      :tick/sweep  → sequence position (tempo/rhythm driver)"
   (:require [overtone.live :refer :all]
+            [datomic.api :as d]
             [gatomic.gorj :as gorj]
             [gatomic.color :as color]
             [com.rpl.specter :as s]))
@@ -226,6 +227,107 @@
      :spi-balanced? (:balanced? spi)
      :tick-count (count ticks)}))
 
+;; ---------------------------------------------------------------------------
+;; Time-travel sonification
+;; ---------------------------------------------------------------------------
+
+(defn version-depth
+  "Depth of a transaction in the Datomic log. Used as chromatic step."
+  [db tx-id]
+  (count (d/tx-range (d/log (d/entity-db db)) nil tx-id)))
+
+(defn rewind-sequence
+  "Get trit-ticks as they existed at a past transaction.
+   Uses d/as-of for true time travel — not reconstruction."
+  [conn tx-id]
+  (let [db (d/as-of (d/db conn) tx-id)]
+    (->> (d/q '[:find [(pull ?e [:tick/site :tick/sweep :tick/s-old
+                                 :tick/s-new :tick/mu :tick/color :tick/tau]) ...]
+                :where [?e :tick/s-new]]
+              db)
+         (sort-by :tick/sweep))))
+
+(defn play-rewind!
+  "Sonify a rewind: play the tick sequence backwards with subtractive timbre.
+   Square wave replaces saw — time-reversed = subtractive."
+  [ticks]
+  (let [reversed (reverse (gorj/flicker-classify ticks))]
+    (doseq [tick reversed]
+      (let [freq (tick->freq tick)
+            [a d s r] (tick->env tick)
+            cutoff (mu->cutoff (:tick/mu tick 0))
+            pan (color->pan (:tick/color tick))]
+        ;; saw-mix=0.0 → pure pulse (subtractive, time-reversed timbre)
+        (trit-tick-voice
+          :freq freq :amp 0.25
+          :cutoff cutoff :rq 0.15
+          :attack r :decay d :sustain s :release a  ; reversed ADSR!
+          :pan (- pan) :saw-mix 0.0))               ; reversed pan too
+      (Thread/sleep (long (tau->dur-ms (:tick/tau tick)))))))
+
+(defn play-merge-chord!
+  "Sonify a merge: play all branch tips simultaneously as a chord.
+   branches = seq of tick sequences (one per branch)."
+  [branches]
+  (doseq [branch branches]
+    (when-let [tip (last (gorj/flicker-classify branch))]
+      (let [freq (tick->freq tip)
+            pan (color->pan (:tick/color tip))]
+        (trit-tick-voice
+          :freq freq :amp (/ 0.4 (count branches))
+          :cutoff 6000 :rq 0.3
+          :attack 0.05 :decay 0.3 :sustain 0.9 :release 1.5
+          :pan pan :saw-mix 0.5)))))
+
+(defn play-checkpoint-triad!
+  "Sonify a GF(3) balanced checkpoint — the trit triad.
+   All three pitch classes play simultaneously = resolved harmony."
+  []
+  (doseq [[trit mix] [[-1 0.8] [0 0.5] [1 0.2]]]
+    (trit-tick-voice
+      :freq (trit->freq trit) :amp 0.25
+      :cutoff 5000 :rq 0.4
+      :attack 0.1 :decay 0.3 :sustain 0.8 :release 2.0
+      :pan (- (* 0.6 trit)) :saw-mix mix)))
+
+(defn scrub-history!
+  "Scrub through Datomic transaction history sonically.
+   Each tx → one note. Speed multiplier controls tempo.
+   speed=1.0 → real-time proportional, speed=4.0 → 4x faster."
+  [conn & [{:keys [speed limit] :or {speed 2.0 limit 50}}]]
+  (let [log (d/log (d/db conn))
+        txs (take limit (d/tx-range log nil nil))]
+    (doseq [{:keys [t data]} txs]
+      (let [db-at (d/as-of (d/db conn) t)
+            ;; Count trit-tick datoms at this point in time
+            tick-count (or (d/q '[:find (count ?e) .
+                                  :where [?e :tick/s-new]] db-at) 0)
+            ;; Depth → chromatic pitch, count → volume
+            freq (* 130.81 (Math/pow 1.059463 (mod tick-count 24)))
+            amp (min 0.4 (* 0.05 (Math/sqrt (max 1 tick-count))))]
+        (trit-tick-voice
+          :freq freq :amp amp
+          :cutoff 3000 :rq 0.3
+          :attack 0.02 :decay 0.1 :sustain 0.5 :release 0.3
+          :pan 0.0 :saw-mix 0.5)
+        (Thread/sleep (long (/ BEAT-MS speed)))))))
+
+(defn conflict-tone!
+  "Sonify a CRDT conflict — tritone interval (the devil's interval).
+   Two frequencies a tritone apart, detuned, with harsh resonance."
+  [tick]
+  (let [freq (tick->freq tick)]
+    ;; Root
+    (trit-tick-voice :freq freq :amp 0.2
+                     :cutoff 1500 :rq 0.08
+                     :attack 0.01 :decay 0.05 :sustain 0.4 :release 0.8
+                     :pan -0.5 :saw-mix 0.9)
+    ;; Tritone (√2 ≈ 1.4142, the irrational interval)
+    (trit-tick-voice :freq (* freq 1.4142) :amp 0.2
+                     :cutoff 1200 :rq 0.08
+                     :attack 0.01 :decay 0.05 :sustain 0.4 :release 0.8
+                     :pan 0.5 :saw-mix 0.9)))
+
 (comment
   ;; Generate and play 12 trit-ticks
   (play-gorj! 12)
@@ -253,4 +355,22 @@
   (let [h (harmonic-health (gorj/generate-ticks 300))]
     (when-not (:within-bound? h)
       (println "ALERT: LEM fraction" (:lem-fraction h) "> 2/3"))
-    h))
+    h)
+
+  ;; --- Time-travel sonification ---
+
+  ;; Rewind: play the last 12 ticks backwards (subtractive timbre)
+  (play-rewind! (gorj/generate-ticks 12))
+
+  ;; Scrub through entire Datomic history as chromatic notes
+  ;; (scrub-history! conn {:speed 4.0 :limit 30})
+
+  ;; Merge chord: two branches converge
+  (play-merge-chord! [(gorj/generate-ticks 1069 0 6)
+                       (gorj/generate-ticks 420 0 6)])
+
+  ;; GF(3) balanced checkpoint — the resolved triad
+  (play-checkpoint-triad!)
+
+  ;; Conflict: CRDT divergence → tritone dissonance
+  (conflict-tone! (first (gorj/generate-ticks 1))))
